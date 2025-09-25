@@ -1,0 +1,11 @@
+{
+  "total_frames": 15,
+  "high_confidence_frames": 15,
+  "confidence_rate": 1.0,
+  "behaviors": {
+    "assault_violence": 15
+  },
+  "behavior_percentages": {
+    "assault_violence": 1.0
+  }
+}

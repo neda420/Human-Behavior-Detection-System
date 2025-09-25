@@ -1,0 +1,15 @@
+opencv-python==4.8.1.78
+mediapipe==0.10.21
+# PyTorch is optional here; comment out to avoid install issues on Py 3.12
+torch==2.1.0
+torchvision==0.16.0
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.4.2
+matplotlib==3.8.4
+seaborn==0.13.2
+pillow==10.4.0
+tqdm==4.66.1
+python-dotenv==1.0.0
+flask==2.3.3
+requests==2.31.0 

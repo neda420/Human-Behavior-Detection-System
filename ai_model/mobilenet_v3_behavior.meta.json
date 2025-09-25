@@ -1,0 +1,8 @@
+{
+  "idx_to_class": {
+    "0": "assault_violence"
+  },
+  "image_size": 224,
+  "model_name": "mobilenet_v3_small",
+  "temperature": 1.0
+}

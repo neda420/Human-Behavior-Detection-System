@@ -1,0 +1,31 @@
+{
+  "email_enabled": false,
+  "email_settings": {
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "sender_email": "",
+    "sender_password": "",
+    "recipient_emails": []
+  },
+  "log_alerts": true,
+  "alert_log_file": "data/logs/alerts.log",
+  "notification_cooldown": 300,
+  "alert_levels": {
+    "low": {
+      "color": "green",
+      "priority": 1
+    },
+    "medium": {
+      "color": "yellow",
+      "priority": 2
+    },
+    "high": {
+      "color": "orange",
+      "priority": 3
+    },
+    "critical": {
+      "color": "red",
+      "priority": 4
+    }
+  }
+}
