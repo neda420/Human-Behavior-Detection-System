@@ -329,8 +329,8 @@ class BehaviorChatbot:
         out += "📊 **Analysis Summary:**\n"
         out += f"• Total frames: {total_frames}\n"
         out += f"• Frames with pose detected: {frames_with_pose}\n"
-        if total_frames:
-            out += f"• Pose detection rate: {frames_with_pose/total_frames:.1%}\n\n"
+        detection_rate = frames_with_pose / total_frames if total_frames else 0.0
+        out += f"• Pose detection rate: {detection_rate:.1%}\n\n"
 
         if behaviors:
             out += "🎭 **Detected Behaviors (ML classifier):**\n"

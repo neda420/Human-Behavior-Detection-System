@@ -396,6 +396,7 @@ class HumanBehaviorDetectionSystem:
         print("=" * 50)
 
         try:
+            t_last_inference_end = 0.0   # track end time of the previous inference call
             while self.realtime_active:
                 # ── Get latest frame from queue ──────────────────────────────
                 try:
@@ -403,18 +404,19 @@ class HumanBehaviorDetectionSystem:
                 except _queue.Empty:
                     continue
 
-                t_frame_start = time.time()
-
                 # ── Pose extraction (every frame for overlay) ────────────────
                 pose_result = self.pose_extractor.extract_pose_from_ndarray(frame)
                 if pose_result:
                     pose_session_data.append(pose_result)
 
-                # ── CNN inference (adaptive — skip if over budget) ───────────
-                elapsed_since_last = time.time() - t_frame_start
-                if elapsed_since_last < _INFERENCE_BUDGET_S and self.cnn_classifier is not None:
+                # ── CNN inference (adaptive — skip if previous inference was recent) ───
+                # Compare against when the last inference *finished*, not the current
+                # frame start time, so slow inference correctly suppresses the next call.
+                time_since_last_inference = time.time() - t_last_inference_end
+                if time_since_last_inference >= _INFERENCE_BUDGET_S and self.cnn_classifier is not None:
                     try:
                         pred, conf, probs_dict = self.cnn_classifier.predict_ndarray(frame)
+                        t_last_inference_end = time.time()
                         if pred is not None:
                             ts  = time.strftime("%H:%M:%S")
                             top3 = sorted(probs_dict.items(), key=lambda x: x[1], reverse=True)[:3]
@@ -447,6 +449,7 @@ class HumanBehaviorDetectionSystem:
                             if alerts:
                                 print(f"[{ts}] 🚨 ALERT: {alerts[0]['behavior']} detected!")
                     except Exception as e:
+                        t_last_inference_end = time.time()
                         logger.warning(f"CNN inference failed: {e}")
 
                 # ── Draw overlays ────────────────────────────────────────────
