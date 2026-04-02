@@ -27,5 +27,11 @@
       "color": "red",
       "priority": 4
     }
+  },
+  "behavior_thresholds": {
+    "falling":    {"severity": "high",     "threshold": 0.30},
+    "fighting":   {"severity": "critical", "threshold": 0.20},
+    "loitering":  {"severity": "medium",   "threshold": 0.50},
+    "running":    {"severity": "medium",   "threshold": 0.40}
   }
 }

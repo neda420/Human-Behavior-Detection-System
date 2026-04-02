@@ -1,0 +1,9 @@
+{
+  "version": 2,
+  "iterations": 100,
+  "train_acc": 1.0,
+  "val_acc": 1.0,
+  "test_acc": 1.0,
+  "feature_dims": 232,
+  "temporal_window": 20
+}
