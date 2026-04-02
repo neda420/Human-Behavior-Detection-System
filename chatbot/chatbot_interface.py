@@ -11,15 +11,26 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Lazy import – avoids circular dependencies and heavy import at module load time.
+def _get_behavior_classifier():
+    from ai_model.predict_behavior import BehaviorClassifier
+    return BehaviorClassifier
+
 class BehaviorChatbot:
     """Chatbot interface for human behavior detection system."""
-    
+
+    _MODEL_PATH = "ai_model/behavior_classifier.pkl"
+
     def __init__(self, data_dir="data"):
         self.data_dir = Path(data_dir)
         self.behavior_data = {}
         self.alert_data = {}
         self.video_metadata = {}
         self.realtime_summary: Dict[str, Any] = {}
+        # ML classifier + prediction cache (video_name → behavior summary dict)
+        self._classifier = None
+        self._prediction_cache: Dict[str, Dict] = {}
+        self._load_classifier()
         self.load_data()
         
         # Define response templates
@@ -41,8 +52,51 @@ class BehaviorChatbot:
             ]
         }
     
+    def _load_classifier(self):
+        """Load the trained BehaviorClassifier (silently skips if not found)."""
+        try:
+            BehaviorClassifier = _get_behavior_classifier()
+            clf = BehaviorClassifier(model_path=self._MODEL_PATH)
+            if clf.model is not None:
+                self._classifier = clf
+                logger.info("BehaviorClassifier loaded into chatbot.")
+            else:
+                logger.warning("BehaviorClassifier model not trained yet; chatbot will show raw pose stats.")
+        except Exception as e:
+            logger.warning(f"Could not load BehaviorClassifier: {e}")
+
+    def _classify_pose_data(self, video_name: str) -> Dict[str, int]:
+        """Return a behavior-count dict for *video_name* using the ML classifier.
+
+        Results are cached to avoid re-running inference on every chatbot query.
+        Falls back to an empty dict if the classifier is unavailable.
+        """
+        if video_name in self._prediction_cache:
+            return self._prediction_cache[video_name]
+
+        pose_data = self.behavior_data.get(video_name)
+        if not pose_data:
+            return {}
+
+        if self._classifier is None:
+            return {}
+
+        try:
+            predictions = self._classifier.predict_with_smoothing(pose_data)
+            if predictions is None or not len(predictions.get('predictions', [])):
+                return {}
+            summary = self._classifier.get_behavior_summary(predictions)
+            behavior_counts = dict(summary.get('behaviors', {}))
+            self._prediction_cache[video_name] = behavior_counts
+            return behavior_counts
+        except Exception as e:
+            logger.error(f"Classifier inference failed for {video_name}: {e}")
+            return {}
+
     def load_data(self):
         """Load behavior detection data and alerts."""
+        # Invalidate prediction cache on reload
+        self._prediction_cache.clear()
         try:
             # Load behavior data from keypoints directory
             keypoints_dir = self.data_dir / "keypoints"
@@ -53,19 +107,19 @@ class BehaviorChatbot:
                         if pose_data_file.exists():
                             with open(pose_data_file, 'rb') as f:
                                 self.behavior_data[subdir.name] = pickle.load(f)
-            
+
             # Load alert data
             alert_log_file = self.data_dir / "logs" / "alerts.log"
             if alert_log_file.exists():
                 self.alert_data = self.load_alert_log(alert_log_file)
-            
+
             # Load video metadata
             self.load_video_metadata()
             # Load latest realtime session summary if available
             self.load_latest_realtime_summary()
-            
+
             logger.info(f"Loaded data for {len(self.behavior_data)} videos")
-            
+
         except Exception as e:
             logger.error(f"Error loading data: {e}")
     def load_latest_realtime_summary(self):
@@ -264,154 +318,73 @@ class BehaviorChatbot:
         return time_info
     
     def get_video_behavior_summary(self, video_name: str) -> str:
-        """Get behavior summary for a specific video."""
+        """Get behavior summary for a specific video using the ML classifier."""
         pose_data = self.behavior_data[video_name]
-        
-        # Count behaviors (simplified - in real implementation, you'd use the classifier)
         total_frames = len(pose_data)
-        frames_with_pose = sum(1 for data in pose_data if data['pose_detected'])
-        
-        # Analyze pose patterns to infer behaviors (simplified)
-        behaviors = self.analyze_pose_patterns(pose_data)
-        
-        summary = f"📹 **Video: {video_name}**\n\n"
-        summary += f"📊 **Analysis Summary:**\n"
-        summary += f"• Total frames: {total_frames}\n"
-        summary += f"• Frames with pose detected: {frames_with_pose}\n"
-        summary += f"• Pose detection rate: {frames_with_pose/total_frames:.1%}\n\n"
-        
+        frames_with_pose = sum(1 for d in pose_data if d['pose_detected'])
+
+        behaviors = self._classify_pose_data(video_name)
+
+        out = f"📹 **Video: {video_name}**\n\n"
+        out += "📊 **Analysis Summary:**\n"
+        out += f"• Total frames: {total_frames}\n"
+        out += f"• Frames with pose detected: {frames_with_pose}\n"
+        detection_rate = frames_with_pose / total_frames if total_frames else 0.0
+        out += f"• Pose detection rate: {detection_rate:.1%}\n\n"
+
         if behaviors:
-            summary += "🎭 **Detected Behaviors:**\n"
-            for behavior, count in behaviors.items():
-                percentage = count / total_frames
-                summary += f"• {behavior}: {count} frames ({percentage:.1%})\n"
-        
-        return summary
-    
+            out += "🎭 **Detected Behaviors (ML classifier):**\n"
+            for behavior, count in sorted(behaviors.items(), key=lambda x: x[1], reverse=True):
+                pct = count / total_frames if total_frames else 0
+                out += f"• {behavior}: {count} frames ({pct:.1%})\n"
+        elif self._classifier is None:
+            out += "_Classifier not loaded — train a model first (option 3 in the menu)._\n"
+        else:
+            out += "_No high-confidence behaviors detected in this video._\n"
+
+        return out
+
     def get_overall_behavior_summary(self) -> str:
-        """Get overall behavior summary across all videos."""
+        """Get overall behavior summary across all videos using the ML classifier."""
         if not self.behavior_data:
             return self.get_random_response('no_data')
-        
-        summary = "📊 **Overall Behavior Summary**\n\n"
-        summary += f"📹 **Videos Analyzed:** {len(self.behavior_data)}\n\n"
-        
-        # Aggregate behavior data
+
+        out = "📊 **Overall Behavior Summary**\n\n"
+        out += f"📹 **Videos Analyzed:** {len(self.behavior_data)}\n\n"
+
         total_frames = 0
-        total_poses = 0
-        all_behaviors = {}
-        
+        total_poses  = 0
+        all_behaviors: Dict[str, int] = {}
+
         for video_name, pose_data in self.behavior_data.items():
-            video_frames = len(pose_data)
-            video_poses = sum(1 for data in pose_data if data['pose_detected'])
-            
-            total_frames += video_frames
-            total_poses += video_poses
-            
-            # Analyze behaviors for this video
-            behaviors = self.analyze_pose_patterns(pose_data)
-            for behavior, count in behaviors.items():
-                all_behaviors[behavior] = all_behaviors.get(behavior, 0) + count
-        
-        summary += f"📈 **Statistics:**\n"
-        summary += f"• Total frames: {total_frames}\n"
-        summary += f"• Total poses detected: {total_poses}\n"
-        summary += f"• Overall pose detection rate: {total_poses/total_frames:.1%}\n\n"
-        
+            total_frames += len(pose_data)
+            total_poses  += sum(1 for d in pose_data if d['pose_detected'])
+            for beh, cnt in self._classify_pose_data(video_name).items():
+                all_behaviors[beh] = all_behaviors.get(beh, 0) + cnt
+
+        out += "📈 **Statistics:**\n"
+        out += f"• Total frames: {total_frames}\n"
+        out += f"• Total poses detected: {total_poses}\n"
+        if total_frames:
+            out += f"• Overall pose detection rate: {total_poses/total_frames:.1%}\n\n"
+
         if all_behaviors:
-            summary += "🎭 **Behavior Distribution:**\n"
-            for behavior, count in sorted(all_behaviors.items(), key=lambda x: x[1], reverse=True):
-                percentage = count / total_frames
-                summary += f"• {behavior}: {count} frames ({percentage:.1%})\n"
-        
-        return summary
-    
-    def analyze_pose_patterns(self, pose_data: List[Dict]) -> Dict[str, int]:
-        """Analyze pose patterns to infer behaviors (simplified implementation)."""
-        behaviors = {}
-        
-        if not pose_data:
-            return behaviors
-        
-        # Simple heuristics for behavior detection
-        for i, data in enumerate(pose_data):
-            if not data['pose_detected'] or not data['landmark_coordinates']:
-                continue
-            
-            landmarks = data['landmark_coordinates']
-            
-            # Check for falling (head position relative to hips)
-            if self.detect_falling(landmarks):
-                behaviors['falling'] = behaviors.get('falling', 0) + 1
-            
-            # Check for fighting (rapid arm movements)
-            if self.detect_fighting(landmarks, pose_data, i):
-                behaviors['fighting'] = behaviors.get('fighting', 0) + 1
-            
-            # Check for running (leg positions)
-            if self.detect_running(landmarks):
-                behaviors['running'] = behaviors.get('running', 0) + 1
-            
-            # Default to normal if no specific behavior detected
-            if not any([self.detect_falling(landmarks), 
-                       self.detect_fighting(landmarks, pose_data, i),
-                       self.detect_running(landmarks)]):
-                behaviors['normal'] = behaviors.get('normal', 0) + 1
-        
-        return behaviors
-    
-    def detect_falling(self, landmarks: Dict) -> bool:
-        """Detect falling behavior based on pose landmarks."""
-        nose = landmarks.get('nose')
-        left_hip = landmarks.get('left_hip')
-        right_hip = landmarks.get('right_hip')
-        
-        if nose and left_hip and right_hip:
-            # Check if head is below hips (falling)
-            hip_y = (left_hip['y'] + right_hip['y']) / 2
-            return nose['y'] > hip_y
-        
-        return False
-    
-    def detect_fighting(self, landmarks: Dict, pose_data: List[Dict], current_idx: int) -> bool:
-        """Detect fighting behavior based on pose landmarks."""
-        left_wrist = landmarks.get('left_wrist')
-        right_wrist = landmarks.get('right_wrist')
-        left_shoulder = landmarks.get('left_shoulder')
-        right_shoulder = landmarks.get('right_shoulder')
-        
-        if all([left_wrist, right_wrist, left_shoulder, right_shoulder]):
-            # Check if wrists are extended away from shoulders
-            left_extension = abs(left_wrist['x'] - left_shoulder['x'])
-            right_extension = abs(right_wrist['x'] - right_shoulder['x'])
-            
-            return left_extension > 0.3 or right_extension > 0.3
-        
-        return False
-    
-    def detect_running(self, landmarks: Dict) -> bool:
-        """Detect running behavior based on pose landmarks."""
-        left_knee = landmarks.get('left_knee')
-        right_knee = landmarks.get('right_knee')
-        left_ankle = landmarks.get('left_ankle')
-        right_ankle = landmarks.get('right_ankle')
-        
-        if all([left_knee, right_knee, left_ankle, right_ankle]):
-            # Check if legs are in running position
-            left_leg_angle = abs(left_knee['y'] - left_ankle['y'])
-            right_leg_angle = abs(right_knee['y'] - right_ankle['y'])
-            
-            return left_leg_angle > 0.2 or right_leg_angle > 0.2
-        
-        return False
-    
+            out += "🎭 **Behavior Distribution (ML classifier):**\n"
+            for beh, cnt in sorted(all_behaviors.items(), key=lambda x: x[1], reverse=True):
+                pct = cnt / total_frames if total_frames else 0
+                out += f"• {beh}: {cnt} frames ({pct:.1%})\n"
+        elif self._classifier is None:
+            out += "_Classifier not loaded — train a model first (option 3 in the menu)._\n"
+
+        return out
+
     def get_recent_alerts(self) -> str:
         """Get recent alerts summary."""
         if not self.alert_data:
             return "No alerts found."
-        
+
         recent_alerts = self.alert_data[-5:]  # Last 5 alerts
-        
+
         summary = "🚨 **Recent Alerts**\n\n"
         for alert in recent_alerts:
             timestamp = alert.get('timestamp', 'Unknown')
@@ -501,15 +474,15 @@ class BehaviorChatbot:
         return summary
     
     def get_behavior_specific_summary(self, behavior: str) -> str:
-        """Get summary for a specific behavior type."""
+        """Get summary for a specific behavior type using the ML classifier."""
         if not self.behavior_data:
             return self.get_random_response('no_data')
-        
+
         total_occurrences = 0
         videos_with_behavior = []
-        
-        for video_name, pose_data in self.behavior_data.items():
-            behaviors = self.analyze_pose_patterns(pose_data)
+
+        for video_name in self.behavior_data:
+            behaviors = self._classify_pose_data(video_name)
             if behavior in behaviors:
                 count = behaviors[behavior]
                 total_occurrences += count
@@ -529,24 +502,24 @@ class BehaviorChatbot:
         return summary
     
     def get_temporal_behavior_summary(self, time_info: Dict) -> str:
-        """Get temporal behavior summary."""
+        """Get temporal behavior summary using the ML classifier."""
         if not self.behavior_data:
             return self.get_random_response('no_data')
-        
-        # This is a simplified implementation
-        # In a real system, you'd have timestamps for each frame
-        summary = "⏰ **Temporal Behavior Analysis**\n\n"
-        summary += "📊 **Behavior Timeline:**\n"
-        
+
+        out = "⏰ **Temporal Behavior Analysis**\n\n"
+        out += "📊 **Behavior Timeline (ML classifier):**\n"
+
         for video_name, pose_data in self.behavior_data.items():
-            behaviors = self.analyze_pose_patterns(pose_data)
-            summary += f"\n📹 **{video_name}:**\n"
-            
-            for behavior, count in behaviors.items():
-                percentage = count / len(pose_data)
-                summary += f"• {behavior}: {percentage:.1%} of video duration\n"
-        
-        return summary
+            behaviors = self._classify_pose_data(video_name)
+            out += f"\n📹 **{video_name}:**\n"
+            if behaviors:
+                for behavior, count in sorted(behaviors.items(), key=lambda x: x[1], reverse=True):
+                    pct = count / len(pose_data) if pose_data else 0
+                    out += f"• {behavior}: {pct:.1%} of video duration\n"
+            else:
+                out += "• No behaviors classified (run model training first).\n"
+
+        return out
     
     def get_statistical_summary(self) -> str:
         """Get statistical summary of behavior data."""

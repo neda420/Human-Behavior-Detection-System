@@ -315,167 +315,184 @@ class HumanBehaviorDetectionSystem:
         return {}
     
     def start_realtime_analysis(self, camera_index: int = 0):
+        """Start real-time behavior analysis from camera.
+
+        Architecture (Phase 7):
+        • **Producer thread** continuously captures frames from the camera and
+          puts them into a bounded ``queue.Queue``.  If the queue is full the
+          oldest frame is dropped so the display stays live.
+        • **Consumer (main thread)** pulls frames from the queue, runs pose
+          extraction and CNN inference, draws overlays, and shows the result.
+        • Inference is *adaptive*: it is skipped when processing the previous
+          frame took longer than ``_INFERENCE_BUDGET_S`` seconds, preventing
+          the display from lagging behind.
+        • A live FPS counter is drawn in the top-right corner.
         """
-        Start real-time behavior analysis from camera.
-        
-        Args:
-            camera_index: Camera device index (usually 0 for default camera)
-        """
+        import queue as _queue
+
         logger.info(f"Starting real-time analysis from camera {camera_index}")
-        
-        # Initialize camera
+
         self.cap = cv2.VideoCapture(camera_index)
         if not self.cap.isOpened():
             logger.error(f"Could not open camera {camera_index}")
             return
-        
-        # Get camera properties
-        fps = self.cap.get(cv2.CAP_PROP_FPS)
-        width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        logger.info(f"Camera initialized: {width}x{height} @ {fps} fps")
-        
-        # Prepare session directory to persist real-time data
+
+        cam_fps = self.cap.get(cv2.CAP_PROP_FPS) or 30
+        width   = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height  = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        logger.info(f"Camera: {width}×{height} @ {cam_fps:.1f} fps")
+
         session_name = f"realtime_session_{time.strftime('%Y%m%d_%H%M%S')}"
-        session_dir = Path("data/keypoints") / session_name
+        session_dir  = Path("data/keypoints") / session_name
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Start monitoring
         self.behavior_monitor.start_monitoring()
         self.realtime_active = True
-        
-        frame_count = 0
-        pose_buffer = []
-        pose_session_data = []  # Persist all frame pose results
-        session_predictions = {
-            'predictions': [],
-            'probabilities': [],
-            'confidence_scores': []
+
+        # ── Shared state ────────────────────────────────────────────────────
+        frame_queue: _queue.Queue = _queue.Queue(maxsize=4)
+
+        pose_session_data: list = []
+        session_predictions: dict = {
+            'predictions': [], 'probabilities': [], 'confidence_scores': []
         }
-        last_analysis_time = time.time()
-        analysis_interval = 2.0  # Analyze every 2 seconds
-        
+        current_overlay: Optional[Dict] = None
+
+        # FPS tracking
+        fps_counter    = 0
+        fps_display    = 0.0
+        fps_last_time  = time.time()
+
+        _INFERENCE_BUDGET_S = 0.08   # 80 ms → up to 12 Hz inference max
+
+        # ── Producer thread ──────────────────────────────────────────────────
+        def _producer():
+            while self.realtime_active:
+                ret, frm = self.cap.read()
+                if not ret:
+                    logger.warning("Camera read failed in producer thread")
+                    break
+                if frame_queue.full():
+                    try:
+                        frame_queue.get_nowait()   # drop oldest frame
+                    except _queue.Empty:
+                        pass
+                frame_queue.put(frm)
+
+        producer_thread = threading.Thread(target=_producer, daemon=True)
+        producer_thread.start()
+
+        # Ensure CNN is ready
+        if self.cnn_classifier is None:
+            try:
+                self.cnn_classifier = BehaviorCNNClassifier()
+                if self.cnn_classifier.model is None:
+                    self.cnn_classifier = None
+            except Exception:
+                self.cnn_classifier = None
+
         print("\n🎥 Real-time Behavior Detection Started")
         print("Press 'q' to quit, 'c' to chat with chatbot")
         print("=" * 50)
-        
+
         try:
+            t_last_inference_end = 0.0   # track end time of the previous inference call
             while self.realtime_active:
-                ret, frame = self.cap.read()
-                if not ret:
-                    logger.warning("Failed to read frame from camera")
-                    break
-                
-                frame_count += 1
-                pose_result = None
-                
-                # Extract pose from current frame
-                pose_result = self.pose_extractor.extract_pose_from_ndarray(frame)
-                if pose_result and pose_result['pose_detected']:
-                    pose_buffer.append(pose_result)
-                if pose_result:
-                    # Save every frame's pose detection result for persistence
-                    pose_session_data.append(pose_result)
-                
-                # Analyze every frame (CNN) for live updates
-                current_time = time.time()
-                predictions = None
-                latest_prediction = None
-                confidence = 0.0
-
-                # Ensure CNN is loaded
-                if self.cnn_classifier is None:
-                    try:
-                        self.cnn_classifier = BehaviorCNNClassifier()
-                        if self.cnn_classifier.model is None:
-                            self.cnn_classifier = None
-                    except Exception:
-                        self.cnn_classifier = None
-
-                probs_dict = {}
-                if self.cnn_classifier is not None:
-                    try:
-                        latest_prediction, confidence, probs_dict = self.cnn_classifier.predict_ndarray(frame)
-                    except Exception as e:
-                        logger.warning(f"CNN inference failed: {e}")
-                        probs_dict = {}
-
-                if latest_prediction is not None:
-                    # Log concise info
-                    timestamp = time.strftime("%H:%M:%S")
-                    top3 = sorted(probs_dict.items(), key=lambda x: x[1], reverse=True)[:3]
-                    top3_str = ", ".join([f"{k}:{v:.2f}" for k, v in top3])
-                    print(f"[{timestamp}] Behavior: {latest_prediction} (Conf: {confidence:.2f}) | {top3_str}")
-
-                    # Persist per-frame
-                    session_predictions['predictions'].append(str(latest_prediction))
-                    session_predictions['confidence_scores'].append(float(confidence))
-                    session_predictions['probabilities'].append(float(max(probs_dict.values()) if probs_dict else confidence))
-
-                    # Compute instantaneous violence from probabilities (include dataset-specific labels)
-                    v = (
-                        1.0 * probs_dict.get('fighting', 0.0)
-                        + 1.0 * probs_dict.get('assault_violence', 0.0)
-                        + 1.0 * probs_dict.get('violence', 0.0)
-                        + 0.8 * probs_dict.get('falling', 0.0)
-                        + 0.3 * probs_dict.get('running', 0.0)
-                    )
-                    v = max(0.0, min(1.0, v))
-                    # Prepare overlay
-                    current_overlay = {
-                        'label': str(latest_prediction),
-                        'confidence': float(confidence),
-                        'probs': probs_dict,
-                        'violence': float(v),
-                    }
-                    if pose_result and pose_result.get('landmark_coordinates') and 'nose' in pose_result['landmark_coordinates']:
-                        nose_lm = pose_result['landmark_coordinates']['nose']
-                        current_overlay['nose_norm'] = (float(nose_lm['x']), float(nose_lm['y']))
-
-                    # Alerts use current probabilities as percentages
-                    summary = {'behavior_percentages': probs_dict}
-                    alerts = self.behavior_monitor.process_behavior_results(summary, "realtime_camera")
-                    if alerts:
-                        print(f"[{timestamp}] 🚨 ALERT: {alerts[0]['behavior']} detected!")
-                
-                # Display frame with pose overlay
-                if pose_result and pose_result['pose_detected']:
-                    # Draw pose landmarks on frame
-                    self.draw_pose_on_frame(frame, pose_result)
-
-                # Draw behavior overlay if available
+                # ── Get latest frame from queue ──────────────────────────────
                 try:
-                    current_overlay
-                except NameError:
-                    current_overlay = None
+                    frame = frame_queue.get(timeout=0.5)
+                except _queue.Empty:
+                    continue
+
+                # ── Pose extraction (every frame for overlay) ────────────────
+                pose_result = self.pose_extractor.extract_pose_from_ndarray(frame)
+                if pose_result:
+                    pose_session_data.append(pose_result)
+
+                # ── CNN inference (adaptive — skip if previous inference was recent) ───
+                # Compare against when the last inference *finished*, not the current
+                # frame start time, so slow inference correctly suppresses the next call.
+                time_since_last_inference = time.time() - t_last_inference_end
+                if time_since_last_inference >= _INFERENCE_BUDGET_S and self.cnn_classifier is not None:
+                    try:
+                        pred, conf, probs_dict = self.cnn_classifier.predict_ndarray(frame)
+                        t_last_inference_end = time.time()
+                        if pred is not None:
+                            ts  = time.strftime("%H:%M:%S")
+                            top3 = sorted(probs_dict.items(), key=lambda x: x[1], reverse=True)[:3]
+                            top3_str = ", ".join(f"{k}:{v:.2f}" for k, v in top3)
+                            print(f"[{ts}] Behavior: {pred} (Conf: {conf:.2f}) | {top3_str}")
+
+                            session_predictions['predictions'].append(str(pred))
+                            session_predictions['confidence_scores'].append(float(conf))
+                            session_predictions['probabilities'].append(
+                                float(max(probs_dict.values())) if probs_dict else float(conf))
+
+                            v = max(0.0, min(1.0, (
+                                1.0 * probs_dict.get('fighting', 0.0)
+                                + 1.0 * probs_dict.get('assault_violence', 0.0)
+                                + 1.0 * probs_dict.get('violence', 0.0)
+                                + 0.8 * probs_dict.get('falling', 0.0)
+                                + 0.3 * probs_dict.get('running', 0.0)
+                            )))
+                            current_overlay = {
+                                'label': str(pred), 'confidence': float(conf),
+                                'probs': probs_dict, 'violence': v,
+                            }
+                            if (pose_result and pose_result.get('landmark_coordinates')
+                                    and 'nose' in pose_result['landmark_coordinates']):
+                                nose_lm = pose_result['landmark_coordinates']['nose']
+                                current_overlay['nose_norm'] = (float(nose_lm['x']), float(nose_lm['y']))
+
+                            alerts = self.behavior_monitor.process_behavior_results(
+                                {'behavior_percentages': probs_dict}, "realtime_camera")
+                            if alerts:
+                                print(f"[{ts}] 🚨 ALERT: {alerts[0]['behavior']} detected!")
+                    except Exception as e:
+                        t_last_inference_end = time.time()
+                        logger.warning(f"CNN inference failed: {e}")
+
+                # ── Draw overlays ────────────────────────────────────────────
+                if pose_result and pose_result.get('pose_detected'):
+                    self.draw_pose_on_frame(frame, pose_result)
                 if current_overlay is not None:
                     self.draw_behavior_overlay(frame, current_overlay)
-                    # Also draw head overlay with a moving 'V' indicator near nose if available
                     self.draw_head_overlay(frame, current_overlay)
 
-                # Show frame
+                # ── FPS counter ──────────────────────────────────────────────
+                fps_counter += 1
+                now = time.time()
+                if now - fps_last_time >= 1.0:
+                    fps_display   = fps_counter / (now - fps_last_time)
+                    fps_counter   = 0
+                    fps_last_time = now
+                fps_text = f"FPS: {fps_display:.1f}"
+                h_f, w_f = frame.shape[:2]
+                (tw, _th), _base = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.putText(frame, fps_text, (w_f - tw - 10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
                 cv2.imshow('Real-time Behavior Detection', frame)
-                
-                # Handle key presses
+
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     break
                 elif key == ord('c'):
                     self.start_chatbot_session()
-        
+
         except KeyboardInterrupt:
             print("\n⚠️  Real-time analysis interrupted")
         finally:
-            # Persist session data
+            self.realtime_active = False
+            producer_thread.join(timeout=2.0)
             try:
                 with open(session_dir / "pose_data.pkl", 'wb') as f:
                     pickle.dump(pose_session_data, f)
-                # Build a predictions dict compatible with get_behavior_summary
                 session_pred_dict = {
-                    'predictions': session_predictions['predictions'],
-                    'probabilities': session_predictions['probabilities'],
-                    'confidence_scores': session_predictions['confidence_scores'] or [0.0] * len(session_predictions['predictions'])
+                    'predictions':     session_predictions['predictions'],
+                    'probabilities':   session_predictions['probabilities'],
+                    'confidence_scores': session_predictions['confidence_scores']
+                    or [0.0] * len(session_predictions['predictions']),
                 }
                 session_summary = self.behavior_classifier.get_behavior_summary(session_pred_dict)
                 with open(session_dir / "summary.json", 'w') as f:
