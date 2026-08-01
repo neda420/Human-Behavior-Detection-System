@@ -5,6 +5,7 @@ from tqdm import tqdm
 import logging
 from pathlib import Path
 
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
